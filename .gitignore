@@ -1,0 +1,16 @@
+# Ignore a folder named venv
+venv/
+
+# Ignore a folder named __pycache__
+__pycache__/
+
+# Ignore all .log folders
+*.log/
+
+# Ignore Output Folders
+dist/
+test-downloads/
+build/
+
+# Ignore Generated spec files
+*.spec
