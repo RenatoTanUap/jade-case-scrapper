@@ -226,7 +226,7 @@ def run_scraper():
             )
             output_box.delete("1.0", tk.END)
             if not results:
-                output_box.insert(tk.END, "No links found.")
+                output_box.insert(tk.END, "No links found. If you expected links, please increase the wait time. The browser may require more time to load the expected case links")
             elif results == ["Scraper stopped abruptly."]:
                 output_box.insert(
                     tk.END, "Scraper stopped abruptly (browser may have been closed).")
