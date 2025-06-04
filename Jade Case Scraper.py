@@ -146,10 +146,12 @@ def scrape_case_links(query, headless=True, wait_time=5, page_load_timeout=60, d
             'a', class_='gwt-Hyperlink alcina-NoHistory') if a.get('href')]
         filtered = filter_links(raw_links)
         links.extend(filtered)
+        text = soup.get_text()
+        match = re.search(r"You are on page \d+ of (\d+)", text)
+        total_pages = int(match.group(1)) if match else 1
 
         seen_links = set(filtered)
-        p = 1
-        while True:
+        for p in range(1, total_pages):
             try:
                 driver.get(build_paginated_url(
                     query, p, court_name, start_date, end_date, use_and))
@@ -163,9 +165,9 @@ def scrape_case_links(query, headless=True, wait_time=5, page_load_timeout=60, d
                     break
                 seen_links.update(new_links)
                 links.extend(new_links)
-            except Exception:
+            except Exception as e:
                 logging.warning(
-                    f"Stopping pagination at page {p} due to error.")
+                    f"Stopping pagination at page {p} due to error.: {e}")
                 break
 
         if download_pdfs and download_dir:
@@ -188,6 +190,8 @@ def scrape_case_links(query, headless=True, wait_time=5, page_load_timeout=60, d
                     failed_downloads.append(
                         f"Failed to download from: {full_url}")
                     continue
+    except TimeoutException:
+        return ["Page timed out."]
     except Exception:
         logging.warning(
             "Browser closed unexpectedly. Scraper stopped abruptly.")
@@ -226,7 +230,11 @@ def run_scraper():
             )
             output_box.delete("1.0", tk.END)
             if not results:
-                output_box.insert(tk.END, "No links found. If you expected links, please increase the wait time. The browser may require more time to load the expected case links")
+                output_box.insert(
+                    tk.END, "No links found. If you expected links, please increase the wait time. The browser may require more time to load the expected case links")
+            elif results == ["Page timed out."]:
+                output_box.insert(
+                    tk.END, "Scraper stopped. Page took too long to load (60 seconds max)")
             elif results == ["Scraper stopped abruptly."]:
                 output_box.insert(
                     tk.END, "Scraper stopped abruptly (browser may have been closed).")
