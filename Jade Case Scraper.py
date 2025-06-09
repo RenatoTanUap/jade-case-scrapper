@@ -26,9 +26,9 @@ import re
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Callable
 
 # Configure logging for debugging
 logging.basicConfig(
@@ -80,6 +80,32 @@ class SearchConfig:
     wait_time: int = DEFAULT_WAIT_TIME
     download_pdfs: bool = False
     download_dir: Optional[str] = None
+    progress_callback: Optional[Callable[[str], None]] = None
+
+
+@dataclass
+class TimingInfo:
+    """Class to track timing information"""
+    start_time: datetime
+    end_time: Optional[datetime] = None
+
+    @property
+    def elapsed(self) -> timedelta:
+        end = self.end_time or datetime.now()
+        return end - self.start_time
+
+    @property
+    def elapsed_str(self) -> str:
+        total_seconds = int(self.elapsed.total_seconds())
+        minutes, seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+
+        if hours > 0:
+            return f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"
 
 
 class JadeScraper:
@@ -88,6 +114,9 @@ class JadeScraper:
     def __init__(self):
         self.driver = None
         self.wait = None
+        self.search_timer = None
+        self.download_timers = {}
+        self.total_timer = None
 
     def get_default_profile_dir(self) -> str:
         """Get the default Chrome profile directory based on OS"""
@@ -227,10 +256,13 @@ class JadeScraper:
             logging.error(f"Error getting total pages: {e}")
             return 1
 
-    def download_pdf(self, link: str, config: SearchConfig) -> bool:
-        """Download PDF for a single case"""
+    def download_pdf(self, link: str, config: SearchConfig, index: int = 0, total: int = 0) -> Tuple[bool, str]:
+        """Download PDF for a single case with timing"""
         full_url = link if link.startswith(
             'http') else f"https://jade.io{link}"
+
+        # Start timing for this download
+        download_timer = TimingInfo(datetime.now())
 
         try:
             self.driver.get(full_url)
@@ -253,14 +285,35 @@ class JadeScraper:
             pdf_button.click()
             time.sleep(3)  # Allow time for download to start
 
-            return True
+            # End timing
+            download_timer.end_time = datetime.now()
+
+            # Update progress if callback provided
+            if config.progress_callback:
+                progress_msg = f"Downloaded {index}/{total} - {download_timer.elapsed_str} - {full_url}"
+                config.progress_callback(progress_msg)
+
+            logging.info(
+                f"Downloaded PDF ({download_timer.elapsed_str}): {full_url}")
+            return True, f"Success ({download_timer.elapsed_str})"
 
         except (TimeoutException, NoSuchElementException, WebDriverException) as e:
-            logging.warning(f"Could not download PDF from {full_url}: {e}")
-            return False
+            download_timer.end_time = datetime.now()
+            error_msg = f"Failed ({download_timer.elapsed_str}): {str(e)[:50]}..."
+
+            if config.progress_callback:
+                progress_msg = f"Failed {index}/{total} - {download_timer.elapsed_str} - {full_url}"
+                config.progress_callback(progress_msg)
+
+            logging.warning(
+                f"Could not download PDF ({download_timer.elapsed_str}) from {full_url}: {e}")
+            return False, error_msg
 
     def scrape_case_links(self, config: SearchConfig) -> Tuple[List[str], List[str]]:
         """Main scraping method that returns links and failed downloads"""
+        # Start total timer
+        self.total_timer = TimingInfo(datetime.now())
+
         if not self.setup_driver(config):
             return [], ["Failed to initialize browser"]
 
@@ -269,6 +322,12 @@ class JadeScraper:
         seen_links: Set[str] = set()
 
         try:
+            # Start search timer
+            self.search_timer = TimingInfo(datetime.now())
+
+            if config.progress_callback:
+                config.progress_callback("Starting search...")
+
             # Get first page
             url = self.build_search_url(config)
             self.driver.get(url)
@@ -283,9 +342,19 @@ class JadeScraper:
             total_pages = self.get_total_pages()
             logging.info(f"Found {total_pages} pages of results")
 
+            if config.progress_callback:
+                config.progress_callback(
+                    f"Found {total_pages} pages to process...")
+
             # Process remaining pages
             for page in range(1, total_pages):
                 try:
+                    if config.progress_callback:
+                        elapsed = TimingInfo(
+                            self.search_timer.start_time).elapsed_str
+                        config.progress_callback(
+                            f"Processing page {page + 1}/{total_pages} - {elapsed} elapsed")
+
                     url = self.build_search_url(config, page)
                     self.driver.get(url)
                     time.sleep(config.wait_time)
@@ -309,17 +378,59 @@ class JadeScraper:
                     logging.warning(f"Error processing page {page + 1}: {e}")
                     break
 
+            # End search timer
+            self.search_timer.end_time = datetime.now()
+
+            if config.progress_callback:
+                config.progress_callback(
+                    f"Search completed in {self.search_timer.elapsed_str} - Found {len(all_links)} links")
+
             # Download PDFs if requested
             if config.download_pdfs and config.download_dir:
                 logging.info(
                     f"Starting PDF downloads for {len(all_links)} links")
-                for i, link in enumerate(all_links, 1):
-                    if not self.download_pdf(link, config):
-                        failed_downloads.append(
-                            f"Failed to download from: {link}")
 
-                    if i % 10 == 0:  # Log progress every 10 downloads
-                        logging.info(f"Downloaded {i}/{len(all_links)} PDFs")
+                if config.progress_callback:
+                    config.progress_callback(
+                        f"Starting PDF downloads for {len(all_links)} links...")
+
+                download_start_time = datetime.now()
+                successful_downloads = 0
+
+                for i, link in enumerate(all_links, 1):
+                    success, result_msg = self.download_pdf(
+                        link, config, i, len(all_links))
+
+                    if success:
+                        successful_downloads += 1
+                    else:
+                        failed_downloads.append(
+                            f"Link {i}: {link} - {result_msg}")
+
+                    # Update overall download progress
+                    if config.progress_callback and i % 5 == 0:  # Update every 5 downloads
+                        download_elapsed = (
+                            datetime.now() - download_start_time).total_seconds()
+                        avg_time_per_download = download_elapsed / i
+                        estimated_remaining = avg_time_per_download * \
+                            (len(all_links) - i)
+
+                        remaining_str = str(
+                            timedelta(seconds=int(estimated_remaining)))
+                        config.progress_callback(
+                            f"Downloads: {successful_downloads}/{i} successful - "
+                            f"Est. remaining: {remaining_str}"
+                        )
+
+                download_total_time = datetime.now() - download_start_time
+                download_time_str = str(
+                    timedelta(seconds=int(download_total_time.total_seconds())))
+
+                if config.progress_callback:
+                    config.progress_callback(
+                        f"Downloads completed in {download_time_str} - "
+                        f"{successful_downloads}/{len(all_links)} successful"
+                    )
 
         except TimeoutException:
             return [], ["Page timed out"]
@@ -327,6 +438,13 @@ class JadeScraper:
             logging.error(f"Unexpected error during scraping: {e}")
             return [], ["Scraper stopped abruptly"]
         finally:
+            # End total timer
+            if self.total_timer:
+                self.total_timer.end_time = datetime.now()
+                if config.progress_callback:
+                    config.progress_callback(
+                        f"Total operation completed in {self.total_timer.elapsed_str}")
+
             self.cleanup()
 
         # Convert relative links to absolute URLs
@@ -462,9 +580,21 @@ class JadeScraperGUI:
         self.current_row += 1
 
         self.output_box = scrolledtext.ScrolledText(
-            self.frame, wrap=tk.WORD, width=80, height=20)
+            self.frame, wrap=tk.WORD, width=80, height=15)
         self.output_box.grid(row=self.current_row, column=0,
                              columnspan=3, pady=5, sticky="nsew")
+        self.frame.rowconfigure(self.current_row, weight=1)
+        self.current_row += 1
+
+        # Add progress log area
+        ttk.Label(self.frame, text="Progress Log:").grid(
+            row=self.current_row, column=0, sticky="w", pady=2)
+        self.current_row += 1
+
+        self.progress_box = scrolledtext.ScrolledText(
+            self.frame, wrap=tk.WORD, width=80, height=8)
+        self.progress_box.grid(row=self.current_row,
+                               column=0, columnspan=3, pady=5, sticky="nsew")
         self.frame.rowconfigure(self.current_row, weight=1)
         self.current_row += 1
 
@@ -478,14 +608,49 @@ class JadeScraperGUI:
         self.status_label = ttk.Label(status_frame, text="Ready")
         self.status_label.grid(row=0, column=0, sticky="w")
 
+        # Add elapsed time label
+        self.elapsed_label = ttk.Label(status_frame, text="")
+        self.elapsed_label.grid(row=0, column=1, sticky="e", padx=10)
+
         self.progress_bar = ttk.Progressbar(status_frame, mode='indeterminate')
-        self.progress_bar.grid(row=0, column=1, sticky="e", padx=10)
+        self.progress_bar.grid(row=0, column=2, sticky="e", padx=10)
+
+        # Start elapsed time updater
+        self.start_time = None
+        self.update_elapsed_time()
 
     def browse_folder(self):
         """Open folder selection dialog"""
         folder = filedialog.askdirectory()
         if folder:
             self.download_dir_var.set(folder)
+
+    def update_elapsed_time(self):
+        """Update the elapsed time display"""
+        if self.start_time:
+            elapsed = datetime.now() - self.start_time
+            total_seconds = int(elapsed.total_seconds())
+            minutes, seconds = divmod(total_seconds, 60)
+            hours, minutes = divmod(minutes, 60)
+
+            if hours > 0:
+                time_str = f"Elapsed: {hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                time_str = f"Elapsed: {minutes}m {seconds}s"
+            else:
+                time_str = f"Elapsed: {seconds}s"
+
+            self.elapsed_label.config(text=time_str)
+
+        # Schedule next update
+        self.root.after(1000, self.update_elapsed_time)
+
+    def update_progress_log(self, message: str):
+        """Update the progress log with timestamp"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.progress_box.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.progress_box.see(tk.END)  # Auto-scroll to bottom
+        self.root.update_idletasks()  # Force GUI update
 
     def validate_inputs(self, config: SearchConfig) -> bool:
         """Validate user inputs before starting scraper"""
@@ -535,7 +700,8 @@ class JadeScraperGUI:
             headless=self.headless_var.get(),
             wait_time=wait_time,
             download_pdfs=self.download_var.get(),
-            download_dir=self.download_dir_var.get().strip() or None
+            download_dir=self.download_dir_var.get().strip() or None,
+            progress_callback=self.update_progress_log
         )
 
     def run_scraper(self):
@@ -575,6 +741,14 @@ class JadeScraperGUI:
                         for failure in failed_downloads:
                             self.output_box.insert(tk.END, f"• {failure}\n")
 
+                # Add final timing summary
+                if self.scraper.total_timer:
+                    summary = f"\n=== TIMING SUMMARY ===\n"
+                    if self.scraper.search_timer and self.scraper.search_timer.end_time:
+                        summary += f"Search phase: {self.scraper.search_timer.elapsed_str}\n"
+                    summary += f"Total operation: {self.scraper.total_timer.elapsed_str}\n"
+                    self.output_box.insert(tk.END, summary)
+
             except Exception as e:
                 messagebox.showerror(
                     "Error", f"An unexpected error occurred: {str(e)}")
@@ -584,17 +758,22 @@ class JadeScraperGUI:
                 self.progress_bar.stop()
                 self.status_label.config(text="Done")
                 self.search_button.config(state="normal")
+                self.start_time = None  # Stop elapsed time counter
 
         # Validate inputs
         config = self.get_search_config()
         if not self.validate_inputs(config):
             return
 
-        # Update UI state
+        # Clear previous results
         self.output_box.delete("1.0", tk.END)
-        self.status_label.config(text="Scraping in progress...")
+        self.progress_box.delete("1.0", tk.END)
+
+        # Update UI state
+        self.status_label.config(text="Initializing scraper...")
         self.progress_bar.start()
         self.search_button.config(state="disabled")
+        self.start_time = datetime.now()  # Start elapsed time counter
 
         # Start scraper in background thread
         threading.Thread(target=scraper_task, daemon=True).start()
