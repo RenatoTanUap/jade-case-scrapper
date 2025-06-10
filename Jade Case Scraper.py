@@ -117,6 +117,8 @@ class JadeScraper:
         self.search_timer = None
         self.download_timers = {}
         self.total_timer = None
+        self.browser_start_time = None
+        self.browser_restart_interval = 1800  # 1 half hour in seconds
 
     def get_default_profile_dir(self) -> str:
         """Get the default Chrome profile directory based on OS"""
@@ -226,6 +228,7 @@ class JadeScraper:
         # Set timeouts
         self.driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT)
         self.wait = WebDriverWait(self.driver, config.wait_time)
+        self.browser_start_time = datetime.now()
         return True
 
     def filter_links(self, links: List[str]) -> List[str]:
@@ -349,6 +352,13 @@ class JadeScraper:
             # Process remaining pages
             for page in range(1, total_pages):
                 try:
+                    # Check if browser needs restart
+                    if self.should_restart_browser():
+                        if not self.restart_browser(config):
+                            logging.error(
+                                "Failed to restart browser, stopping pagination")
+                            break
+
                     if config.progress_callback:
                         elapsed = TimingInfo(
                             self.search_timer.start_time).elapsed_str
@@ -398,6 +408,15 @@ class JadeScraper:
                 successful_downloads = 0
 
                 for i, link in enumerate(all_links, 1):
+                    # Check if browser needs restart during downloads
+                    if self.should_restart_browser():
+                        if not self.restart_browser(config):
+                            logging.error(
+                                "Failed to restart browser during downloads")
+                            failed_downloads.append(
+                                f"Link {i}: {link} - Browser restart failed")
+                            continue
+
                     success, result_msg = self.download_pdf(
                         link, config, i, len(all_links))
 
@@ -455,6 +474,46 @@ class JadeScraper:
 
         return absolute_links, failed_downloads
 
+    def should_restart_browser(self) -> bool:
+        """Check if browser should be restarted based on elapsed time"""
+        if not self.browser_start_time:
+            return False
+
+        elapsed = (datetime.now() - self.browser_start_time).total_seconds()
+        return elapsed >= self.browser_restart_interval
+
+    def restart_browser(self, config: SearchConfig) -> bool:
+        """Restart the browser to prevent memory issues"""
+        try:
+            if config.progress_callback:
+                config.progress_callback("Restarting browser after 1 hour...")
+
+            logging.info("Restarting browser after half hour of operation")
+
+            # Clean up current driver
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception as e:
+                    logging.warning(f"Error closing old driver: {e}")
+
+            # Wait a moment for cleanup
+            time.sleep(2)
+
+            # Setup new driver
+            success = self.setup_driver(config)
+
+            if success and config.progress_callback:
+                config.progress_callback("Browser restarted successfully")
+
+            return success
+
+        except Exception as e:
+            logging.error(f"Error restarting browser: {e}")
+            if config.progress_callback:
+                config.progress_callback(f"Browser restart failed: {e}")
+            return False
+
     def cleanup(self):
         """Clean up resources"""
         if self.driver:
@@ -465,6 +524,7 @@ class JadeScraper:
             finally:
                 self.driver = None
                 self.wait = None
+                self.browser_start_time = None
 
 
 class JadeScraperGUI:
@@ -477,7 +537,7 @@ class JadeScraperGUI:
 
     def setup_ui(self):
         """Initialize the user interface"""
-        self.root.title("Jade.io Case Search - Optimized")
+        self.root.title("Jade.io Case Scraper")
         self.root.geometry("900x700")
 
         # Main frame
